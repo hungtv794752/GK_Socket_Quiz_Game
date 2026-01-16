@@ -2,13 +2,9 @@
 
 ## Nội dung
 - TCP Chat Client
-- UDP Client
-- IPv6 TCP Client
 - GUI Client (Tkinter)
 
 ## Cách chạy
 ```bash
 python client_tcp_chat.py
-python client_udp.py
-python client_ipv6.py
 python client_gui.py

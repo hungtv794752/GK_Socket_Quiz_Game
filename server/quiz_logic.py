@@ -14,39 +14,36 @@ class Question:
 
 
 class QuizGame:
-    """
-    Quiz logic:
-    - Load question bank from JSON
-    - Start a round -> broadcast question + start_time
-    - Accept answers from many clients
-    - Score:
-        + Correct: base_score + speed bonus
-        + Wrong/timeout: 0
-      Speed bonus: faster -> higher
-    """
-
-    def __init__(self, questions_path: str = "questions.json"):
+    def __init__(self, questions_path: str = "server/questions.json"):
+        self.round_players: set[str] = set()
         self.questions_path = questions_path
+
+        # Config (loaded from JSON)
         self.title = "Quiz"
         self.time_limit_sec = 10
         self.base_score = 100
         self.fast_bonus_max = 50
 
+        # Question bank
         self.questions: List[Question] = []
-        self.q_index = 0
+        self.question_map: Dict[str, Question] = {}
 
-        # Round state
+        # Game state
+        self.q_index = 0
         self.round_active = False
         self.round_qid: Optional[str] = None
         self.round_start = 0.0
+        self.running = False
 
-        # answers[qid][player] = (answer, time_sec)
+        # answers[qid][player] = (answer, elapsed)
         self.answers: Dict[str, Dict[str, Tuple[str, float]]] = {}
 
-        # scoreboard[player] = {"score": int, "wins": int, "rounds": int}
+        # scoreboard[player] = stats
         self.scoreboard: Dict[str, Dict[str, int]] = {}
 
         self.load_questions()
+
+    # ---------- loading ----------
 
     def load_questions(self) -> None:
         with open(self.questions_path, "r", encoding="utf-8") as f:
@@ -57,28 +54,30 @@ class QuizGame:
         self.base_score = int(data.get("base_score", self.base_score))
         self.fast_bonus_max = int(data.get("fast_bonus_max", self.fast_bonus_max))
 
-        qs = []
+        self.questions.clear()
+        self.question_map.clear()
+
         for item in data["questions"]:
-            qs.append(
-                Question(
-                    qid=item["id"],
-                    text=item["question"],
-                    choices=item["choices"],
-                    answer=item["answer"],
-                )
+            q = Question(
+                qid=item["id"],
+                text=item["question"],
+                choices=item["choices"],
+                answer=item["answer"],
             )
-        self.questions = qs
+            self.questions.append(q)
+            self.question_map[q.qid] = q
+
         self.q_index = 0
+
+    # ---------- game flow ----------
 
     def has_next_question(self) -> bool:
         return self.q_index < len(self.questions)
 
     def start_round(self) -> Dict:
-        """
-        Start a new round and return a payload that server can broadcast.
-        """
         if not self.has_next_question():
-            return {"type": "game_over", "message": "No more questions"}
+            self.running = False
+            return {"type": "game_over"}
 
         q = self.questions[self.q_index]
         self.q_index += 1
@@ -86,9 +85,9 @@ class QuizGame:
         self.round_active = True
         self.round_qid = q.qid
         self.round_start = time.time()
+        self.running = True
 
-        if q.qid not in self.answers:
-            self.answers[q.qid] = {}
+        self.answers[q.qid] = {}
 
         return {
             "type": "question",
@@ -96,83 +95,93 @@ class QuizGame:
             "question": q.text,
             "choices": q.choices,
             "time_limit_sec": self.time_limit_sec,
-            "server_time": self.round_start,  # optional
+            "server_time": self.round_start,
         }
 
     def submit_answer(self, player: str, qid: str, answer: str) -> Dict:
-        """
-        Server calls this when a client answers.
-        Return an ack payload.
-        """
         if not self.round_active or qid != self.round_qid:
-            return {"type": "answer_ack", "ok": False, "reason": "round_not_active"}
+            return {
+                "type": "answer_ack",
+                "ok": False,
+                "reason": "round_not_active",
+            }
 
         elapsed = time.time() - self.round_start
-        if elapsed > self.time_limit_sec:
-            return {"type": "answer_ack", "ok": False, "reason": "timeout"}
+        late = elapsed > self.time_limit_sec
 
-        # Only take the first answer per player per question
+        # prevent double answers
         if player in self.answers[qid]:
-            return {"type": "answer_ack", "ok": False, "reason": "already_answered"}
+            return {
+                "type": "answer_ack",
+                "ok": False,
+                "reason": "already_answered",
+            }
 
-        self.answers[qid][player] = (answer, elapsed)
+        # ALWAYS record the answer (even if late)
+        self.answers[qid][player] = (answer, elapsed, late)
 
-        # Track rounds participated
         self._ensure_player(player)
-        self.scoreboard[player]["rounds"] += 1
 
-        return {"type": "answer_ack", "ok": True, "elapsed": round(elapsed, 3)}
+        return {
+            "type": "answer_ack",
+            "ok": True,
+            "elapsed": round(elapsed, 3),
+            "late": late,
+        }
+
 
     def end_round_and_score(self) -> Dict:
-        """
-        End current round, score everyone, determine fastest correct winner.
-        Return a payload for server broadcast: results + leaderboard.
-        """
         if not self.round_active or not self.round_qid:
-            return {"type": "round_result", "ok": False, "reason": "no_active_round"}
+            return {"type": "round_result", "ok": False}
 
         qid = self.round_qid
-        q = next((x for x in self.questions if x.qid == qid), None)
-        # q might be not found because self.questions was advanced, so find in bank by id safely:
-        correct = self._get_correct_answer(qid)
+        q = self.question_map.get(qid)
+        correct = q.answer if q else ""
 
-        # Determine correct answers and fastest time
-        correct_players: List[Tuple[str, float]] = []
-        for player, (ans, t) in self.answers.get(qid, {}).items():
-            if self._normalize(ans) == self._normalize(correct):
-                correct_players.append((player, t))
+        # --- determine correct (on-time) players ---
+        correct_players: list[tuple[str, float]] = []
 
-        correct_players.sort(key=lambda x: x[1])  # fastest first
+        for player, (ans, elapsed, late) in self.answers[qid].items():
+            if not late and self._normalize(ans) == self._normalize(correct):
+                correct_players.append((player, elapsed))
+
+        # fastest correct wins
+        correct_players.sort(key=lambda x: x[1])
         winner = correct_players[0][0] if correct_players else None
 
-        # Score each player who answered
-        scored_detail = []
-        for player, (ans, t) in self.answers.get(qid, {}).items():
+        # --- build details & score ---
+        details = []
+
+        for player, (ans, elapsed, late) in self.answers[qid].items():
             is_correct = self._normalize(ans) == self._normalize(correct)
-            pts = 0
-            bonus = 0
+            scored = is_correct and not late
 
-            if is_correct:
-                bonus = self._speed_bonus(t)
-                pts = self.base_score + bonus
-                self.scoreboard[player]["score"] += pts
+            bonus = self._speed_bonus(elapsed) if scored else 0
+            points = (self.base_score + bonus) if scored else 0
 
-            scored_detail.append(
+            if scored:
+                self.scoreboard[player]["score"] += points
+
+            details.append(
                 {
                     "player": player,
                     "answer": ans,
-                    "time_sec": round(t, 3),
+                    "time_sec": round(elapsed, 3),
+                    "late": late,
                     "correct": is_correct,
+                    "points": points,
                     "bonus": bonus,
-                    "points": pts,
                 }
             )
 
-        # Winner gets a "win" count (ai trả lời đúng nhanh nhất)
+        # winner gets win
         if winner:
             self.scoreboard[winner]["wins"] += 1
 
-        # round ends
+        # count round participation for ALL players
+        self._finalize_round_participation()
+
+        # close round
         self.round_active = False
         self.round_qid = None
         self.round_start = 0.0
@@ -183,52 +192,78 @@ class QuizGame:
             "qid": qid,
             "correct_answer": correct,
             "winner": winner,
-            "details": scored_detail,
+            "details": details,
             "leaderboard": self.get_leaderboard(),
         }
 
-    def get_leaderboard(self) -> List[Dict]:
-        """
-        Return sorted leaderboard by score desc, then wins desc
-        """
-        items = []
-        for player, stats in self.scoreboard.items():
-            items.append(
-                {
-                    "player": player,
-                    "score": stats["score"],
-                    "wins": stats["wins"],
-                    "rounds": stats["rounds"],
-                }
-            )
-        items.sort(key=lambda x: (x["score"], x["wins"]), reverse=True)
-        return items
 
-    # ----------------- helpers -----------------
+    # ---------- leaderboard ----------
+
+    def get_leaderboard(self) -> List[Dict]:
+        board = [
+            {
+                "player": p,
+                "score": s["score"],
+                "wins": s["wins"],
+                "rounds": s["rounds"],
+            }
+            for p, s in self.scoreboard.items()
+        ]
+        board.sort(key=lambda x: (x["score"], x["wins"]), reverse=True)
+        return board
+
+
+    # ---------- helpers ----------
+
+    def reset(self) -> None:
+        """Hard reset for new game (use when all players leave)"""
+        self.q_index = 0
+        self.round_active = False
+        self.round_qid = None
+        self.round_start = 0.0
+        self.answers.clear()
+        self.scoreboard.clear()
+        self.round_players.clear()   # 👈 NEW
+        self.running = False
+
+
     def _ensure_player(self, player: str) -> None:
         if player not in self.scoreboard:
-            self.scoreboard[player] = {"score": 0, "wins": 0, "rounds": 0}
+            self.scoreboard[player] = {
+                "score": 0,
+                "wins": 0,
+                "rounds": 0,
+            }
+
+
+    def _register_round_players(self, players: list[str]) -> None:
+        """
+        Call once at the start of a round.
+        Every player here will get rounds += 1 when the round ends.
+        """
+        self.round_players = set(players)
+        for p in self.round_players:
+            self._ensure_player(p)
+
+
+    def _finalize_round_participation(self) -> None:
+        """
+        Call once when the round ends.
+        Counts the round for ALL players, even if they answered late or not at all.
+        """
+        for p in self.round_players:
+            self.scoreboard[p]["rounds"] += 1
+
+        self.round_players.clear()
+
 
     def _speed_bonus(self, elapsed: float) -> int:
-        """
-        Bonus decreases linearly from fast_bonus_max at t=0
-        to 0 at t=time_limit_sec.
-        """
         if elapsed <= 0:
             return self.fast_bonus_max
         if elapsed >= self.time_limit_sec:
             return 0
-        ratio = 1.0 - (elapsed / self.time_limit_sec)
-        return int(round(self.fast_bonus_max * ratio))
+        return int(round(self.fast_bonus_max * (1 - elapsed / self.time_limit_sec)))
 
-    def _get_correct_answer(self, qid: str) -> str:
-        # Find from loaded questions bank by qid
-        for item in self.questions:
-            if item.qid == qid:
-                return item.answer
-        # If not found (edge), load again or return empty
-        # But normally should exist
-        return ""
 
     @staticmethod
     def _normalize(s: str) -> str:
